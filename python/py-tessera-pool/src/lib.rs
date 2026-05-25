@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use tessera_pool::{
-    Descriptor as RustDescriptor, Lease as RustLease, Pool as RustPool, PoolConfig,
+    Descriptor as RustDescriptor, Lease as RustLease, LeaseId, Pool as RustPool, PoolConfig,
     TesseraPoolError as RustPoolError,
 };
 
@@ -64,6 +64,34 @@ impl PyLease {
             self.inner.lease_id()
         )
     }
+
+    /// Picklable via `(_lease_from_bytes, (slot_index, generation, lease_id_bytes))`.
+    fn __reduce__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyAny>, (u32, u64, Bound<'py, PyBytes>))> {
+        let factory = py
+            .import_bound("tessera_pool")?
+            .getattr("_lease_from_bytes")?;
+        let lease_bytes = PyBytes::new_bound(py, &self.inner.lease_id().to_bytes());
+        Ok((
+            factory,
+            (self.inner.slot_index(), self.inner.generation(), lease_bytes),
+        ))
+    }
+}
+
+/// Factory used by `Lease.__reduce__` to rebuild a Lease from
+/// (slot_index, generation, lease_id_bytes). Exposed at module level
+/// so pickle can resolve it as `tessera_pool._lease_from_bytes`.
+#[pyfunction]
+fn _lease_from_bytes(slot_index: u32, generation: u64, lease_id_bytes: &[u8]) -> PyResult<PyLease> {
+    let bytes: [u8; 16] = lease_id_bytes.try_into().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err("lease_id_bytes must be 16 bytes")
+    })?;
+    Ok(PyLease {
+        inner: RustLease::new(slot_index, LeaseId::from_bytes(bytes), generation),
+    })
 }
 
 /// Read-only descriptor for cross-IPC handoff. Returned by `Pool.write`.
@@ -104,6 +132,47 @@ impl PyDescriptor {
             self.inner.lease_id()
         )
     }
+
+    /// Picklable via `(_descriptor_from_bytes, (slot_index, generation, lease_id_bytes, size_bytes))`.
+    /// This is the canonical IPC handoff path: send a Descriptor through a
+    /// multiprocessing.Queue / Pipe; pickle reconstructs it on the worker side.
+    fn __reduce__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyAny>, (u32, u64, Bound<'py, PyBytes>, u32))> {
+        let factory = py
+            .import_bound("tessera_pool")?
+            .getattr("_descriptor_from_bytes")?;
+        let lease_bytes = PyBytes::new_bound(py, &self.inner.lease_id().to_bytes());
+        Ok((
+            factory,
+            (
+                self.inner.slot_index(),
+                self.inner.generation(),
+                lease_bytes,
+                self.inner.size_bytes(),
+            ),
+        ))
+    }
+}
+
+/// Factory used by `Descriptor.__reduce__` to rebuild a Descriptor from
+/// (slot_index, generation, lease_id_bytes, size_bytes). Exposed at
+/// module level so pickle can resolve it as
+/// `tessera_pool._descriptor_from_bytes`.
+#[pyfunction]
+fn _descriptor_from_bytes(
+    slot_index: u32,
+    generation: u64,
+    lease_id_bytes: &[u8],
+    size_bytes: u32,
+) -> PyResult<PyDescriptor> {
+    let bytes: [u8; 16] = lease_id_bytes.try_into().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err("lease_id_bytes must be 16 bytes")
+    })?;
+    Ok(PyDescriptor {
+        inner: RustDescriptor::new(slot_index, LeaseId::from_bytes(bytes), generation, size_bytes),
+    })
 }
 
 /// Non-lossy lease-backed shared-memory pool.
@@ -306,6 +375,8 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPool>()?;
     m.add_class::<PyLease>()?;
     m.add_class::<PyDescriptor>()?;
+    m.add_function(wrap_pyfunction!(_lease_from_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(_descriptor_from_bytes, m)?)?;
     m.add(
         "TesseraPoolError",
         py.get_type_bound::<TesseraPoolError>(),

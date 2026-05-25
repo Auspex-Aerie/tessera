@@ -25,7 +25,15 @@ Public symbols:
 - ``TesseraPoolError``: base exception class for all pool errors.
 """
 
-from tessera_pool._native import Descriptor, Lease, Pool, TesseraPoolError
+from tessera_pool._native import (
+    Descriptor,
+    Lease,
+    Pool,
+    TesseraPoolError,
+    _descriptor_from_bytes,
+    _lease_from_bytes,
+)
 
 __version__ = "0.0.1"
 __all__ = ["Descriptor", "Lease", "Pool", "TesseraPoolError"]
+
