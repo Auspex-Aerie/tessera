@@ -62,6 +62,12 @@ pub struct WorkerParams {
     pub ack_slot_size_bytes: u32,
     /// This worker's index, for diagnostics.
     pub worker_id: u32,
+    /// Recovery escape hatch forwarded from the owner: when `true`, the
+    /// worker unlinks + recreates its control region if a stale one
+    /// already exists (e.g. left by a SIGKILLed predecessor after a
+    /// failed start). When `false` it fails loud on a pre-existing
+    /// region, surfacing a same-description double-Sink misuse.
+    pub force_recreate: bool,
 }
 
 /// Per-job streaming state held while chunks arrive.
@@ -96,7 +102,7 @@ pub fn run_worker(params: WorkerParams) -> Result<()> {
         slot_count: params.control_slot_count,
         slot_size_bytes: params.control_slot_size_bytes,
         role: ChannelRole::Receiver,
-        force_recreate: false,
+        force_recreate: params.force_recreate,
     })?;
 
     // The owner created the ack region before spawning us; attach.

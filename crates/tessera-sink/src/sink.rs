@@ -13,7 +13,8 @@
 
 use std::collections::HashMap;
 use std::process::Child;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tessera_channel::{Channel, ChannelConfig, ChannelRole, TesseraChannelError};
 use tessera_pool::{Lease, Pool, PoolConfig};
@@ -102,19 +103,45 @@ impl Sink {
         let mut workers: Vec<Child> = Vec::with_capacity(config.worker_count as usize);
         let mut controls: Vec<Channel> = Vec::with_capacity(config.worker_count as usize);
 
-        for worker_id in 0..config.worker_count {
-            let params = Self::worker_params(&base, &config, worker_id);
-            let mut child = spawn::build_worker_command(&bin, &params)
-                .spawn()
-                .map_err(|e| TesseraSinkError::WorkerSpawn {
-                    worker_id,
-                    message: e.to_string(),
-                })?;
-            // Worker creates its control region as Receiver; we attach
-            // as Sender, retrying until it exists (or the worker dies).
-            let control = Self::attach_control(&base, &config, worker_id, &mut child)?;
-            workers.push(child);
-            controls.push(control);
+        // If any worker fails to spawn or attach, the children we've
+        // already launched must be killed: dropping `Child` does NOT
+        // terminate the process, so they'd otherwise become orphans
+        // holding SHM mappings and blocking a retry. Run the spawn loop
+        // in a closure so a single error path handles the cleanup.
+        let build = (|| -> Result<()> {
+            for worker_id in 0..config.worker_count {
+                let params = Self::worker_params(&base, &config, worker_id);
+                let mut child = spawn::build_worker_command(&bin, &params)
+                    .spawn()
+                    .map_err(|e| TesseraSinkError::WorkerSpawn {
+                        worker_id,
+                        message: e.to_string(),
+                    })?;
+                // Worker creates its control region as Receiver; we
+                // attach as Sender, retrying until it exists (or dies).
+                match Self::attach_control(&base, &config, worker_id, &mut child) {
+                    Ok(control) => {
+                        workers.push(child);
+                        controls.push(control);
+                    }
+                    Err(e) => {
+                        // This child isn't tracked yet — kill it here;
+                        // the outer cleanup handles the already-pushed ones.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = build {
+            for mut child in workers.drain(..) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return Err(e);
         }
 
         Ok(Self {
@@ -143,6 +170,7 @@ impl Sink {
             ack_slot_count: config.ack_slot_count,
             ack_slot_size_bytes: config.ack_slot_size_bytes,
             worker_id,
+            force_recreate: config.force_recreate,
         }
     }
 
@@ -535,16 +563,29 @@ impl Drop for Sink {
     }
 }
 
-/// Draw a random 128-bit job id from `/dev/urandom`, falling back to a
-/// monotonic-clock mix if the device is unavailable.
+/// Draw a 128-bit job id. Prefers `/dev/urandom`; if that's
+/// unavailable, falls back to a mix guaranteed unique *within this
+/// process* (a monotonic counter in the high 64 bits, so successive
+/// calls never collide) plus pid + wall-clock nanos to reduce
+/// cross-process collision odds. Job ids key `jobs` / `outstanding`,
+/// so a collision would corrupt in-flight state — uniqueness matters
+/// more here than cryptographic randomness.
 fn random_u128() -> u128 {
     let mut bytes = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         use std::io::Read;
-        let _ = f.read_exact(&mut bytes);
-    } else {
-        let now = Instant::now().elapsed().as_nanos();
-        bytes.copy_from_slice(&now.to_le_bytes());
+        if f.read_exact(&mut bytes).is_ok() {
+            return u128::from_le_bytes(bytes);
+        }
     }
-    u128::from_le_bytes(bytes)
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id() as u64;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // High 64 bits = monotonic counter → unique per process per call.
+    // Low 64 bits = pid mixed with wall-clock nanos.
+    ((n as u128) << 64) | ((pid as u128) << 32) | ((nanos as u64) as u128 & 0xFFFF_FFFF)
 }

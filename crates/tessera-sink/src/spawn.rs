@@ -33,6 +33,8 @@ const ARG_CONTROL_SLOT_SIZE: &str = "--control-slot-size-bytes";
 const ARG_ACK_SLOT_COUNT: &str = "--ack-slot-count";
 const ARG_ACK_SLOT_SIZE: &str = "--ack-slot-size-bytes";
 const ARG_WORKER_ID: &str = "--worker-id";
+/// Boolean flag (presence = true) forwarding the owner's force_recreate.
+const ARG_FORCE_RECREATE: &str = "--force-recreate";
 
 /// Build the `Command` that launches one worker with `params`.
 pub fn build_worker_command(bin: &Path, params: &WorkerParams) -> Command {
@@ -57,6 +59,9 @@ pub fn build_worker_command(bin: &Path, params: &WorkerParams) -> Command {
         .arg(params.ack_slot_size_bytes.to_string())
         .arg(ARG_WORKER_ID)
         .arg(params.worker_id.to_string());
+    if params.force_recreate {
+        cmd.arg(ARG_FORCE_RECREATE);
+    }
     cmd
 }
 
@@ -76,10 +81,16 @@ where
     let mut ack_slot_count = None;
     let mut ack_slot_size_bytes = None;
     let mut worker_id = None;
+    let mut force_recreate = false;
 
     let mut it = args.into_iter();
     while let Some(key) = it.next() {
         let key = key.to_string_lossy().into_owned();
+        // Presence-only boolean flag — does not consume a value.
+        if key == ARG_FORCE_RECREATE {
+            force_recreate = true;
+            continue;
+        }
         let val = it.next().ok_or_else(|| {
             TesseraSinkError::Config(format!("missing value for worker arg {key}"))
         })?;
@@ -114,6 +125,7 @@ where
         ack_slot_count: require(ack_slot_count, ARG_ACK_SLOT_COUNT)?,
         ack_slot_size_bytes: require(ack_slot_size_bytes, ARG_ACK_SLOT_SIZE)?,
         worker_id: require(worker_id, ARG_WORKER_ID)?,
+        force_recreate,
     })
 }
 
@@ -183,16 +195,20 @@ mod tests {
             ack_slot_count: 256,
             ack_slot_size_bytes: 2048,
             worker_id: 2,
+            force_recreate: false,
         }
+    }
+
+    fn round_trip(p: &WorkerParams) -> WorkerParams {
+        let cmd = build_worker_command(Path::new("/bin/tessera-sink-worker"), p);
+        let args: Vec<OsString> = cmd.get_args().map(|a| a.to_owned()).collect();
+        parse_worker_args(args).expect("parse")
     }
 
     #[test]
     fn argv_round_trips_through_command_and_parser() {
         let p = params();
-        let cmd = build_worker_command(Path::new("/bin/tessera-sink-worker"), &p);
-        // Extract the args the Command was built with.
-        let args: Vec<OsString> = cmd.get_args().map(|a| a.to_owned()).collect();
-        let parsed = parse_worker_args(args).expect("parse");
+        let parsed = round_trip(&p);
         assert_eq!(parsed.pool_description, p.pool_description);
         assert_eq!(parsed.control_description, p.control_description);
         assert_eq!(parsed.ack_description, p.ack_description);
@@ -203,6 +219,17 @@ mod tests {
         assert_eq!(parsed.ack_slot_count, p.ack_slot_count);
         assert_eq!(parsed.ack_slot_size_bytes, p.ack_slot_size_bytes);
         assert_eq!(parsed.worker_id, p.worker_id);
+        assert!(!parsed.force_recreate);
+    }
+
+    #[test]
+    fn force_recreate_flag_round_trips() {
+        let mut p = params();
+        p.force_recreate = true;
+        assert!(round_trip(&p).force_recreate);
+        // And stays false when not set.
+        p.force_recreate = false;
+        assert!(!round_trip(&p).force_recreate);
     }
 
     #[test]
