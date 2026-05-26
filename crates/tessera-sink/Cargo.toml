@@ -14,3 +14,9 @@ name = "tessera_sink"
 
 [dependencies]
 tessera-pool = { workspace = true }
+tessera-channel = { workspace = true }
+blake3 = { workspace = true }
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
