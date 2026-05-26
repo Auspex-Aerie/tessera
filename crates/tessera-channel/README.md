@@ -4,9 +4,9 @@ Non-lossy MPSC (multi-producer, single-consumer) shared-memory queue.
 Credit-based backpressure (block / try / timeout), FIFO ordering,
 caller-selected send mode per call.
 
-**Status**: v0.0.1 — Rust core landing in [Stage 4c of the upstream
-extraction plan](https://github.com/Indubitable-Industries/Bayence-Certus/blob/main/claudedocs/plans/mp_tools_open_source_extraction_2026-05-23.md).
-CI wiring + crates.io / PyPI publish land in Stage 5.
+**Status**: v0.0.1 — Rust core + PyO3 facade functional. CI wiring
++ crates.io / PyPI publish land in Stage 5 of the upstream extraction
+plan.
 
 ## What it does
 
@@ -63,6 +63,25 @@ let msg = receiver.recv()?;
 For Python ergonomics, install the
 [`tessera-channel`](../../python/py-tessera-channel/) Python facade and
 use `from tessera_channel import Channel` with the same API.
+
+## Tests
+
+`cargo test -p tessera-channel --lib` — 45 tests covering:
+
+- Header layout invariants + Pod round-trips (10)
+- BLAKE3-derived namespace + Pool/Ring/Channel name disjointness (5)
+- Region create/attach lifecycle + bounds checks + atomic field
+  accessors + handoff/stale-unlink safety (20)
+- State machine: send/recv happy path, ordered delivery, ring
+  wraparound, try_send/try_recv fail-fast, send_timeout/recv_timeout
+  bounded blocking, role enforcement, oversized rejection,
+  MPSC concurrent (4 producers × 100 msgs, no loss) (10)
+
+Plus 31 Python end-to-end tests in `python/py-tessera-channel/tests/`
+and two runnable cross-process examples at `examples/channel_intra_container.py`
+(receiver + subprocess sender) and `examples/channel_mpsc.py` (4
+subprocess senders + single receiver, 200 msgs verified delivered
+exactly once).
 
 ## Use cases
 
