@@ -228,6 +228,39 @@ def test_reader_rejects_unknown_section():
             ring.reader(99)
 
 
+def test_closing_ring_invalidates_existing_writer_and_reader():
+    # Codex P2 fix on PR #2 (`d467b14`): Ring.close() must invalidate
+    # previously-issued Writer / Reader handles. Without the closed-flag
+    # propagation, those handles kept cloned Arc<Region>s alive and
+    # continued to function past close() — violating the documented
+    # "deterministic close" semantic.
+    desc = _unique_description("close-invalidates-children")
+    ring = Ring(description=desc, sections=[(0, 4, 64)])
+    writer = ring.writer()
+    reader = ring.reader(0)
+    # Pre-close: child handles work normally.
+    writer.publish(0, b"before close")
+    events = reader.poll()
+    assert len(events) == 1
+    assert events[0].payload == b"before close"
+
+    ring.close()
+    assert ring.is_closed
+
+    # Post-close: all API operations on the child handles raise.
+    with pytest.raises(TesseraRingError, match="closed"):
+        writer.publish(0, b"after close")
+    with pytest.raises(TesseraRingError, match="closed"):
+        reader.poll()
+    with pytest.raises(TesseraRingError, match="closed"):
+        reader.stats()
+
+    # Cursor / dropped getters remain readable so consumers can inspect
+    # final state (per the close() docstring's explicit carve-out).
+    _ = reader.cursor
+    _ = reader.dropped
+
+
 def test_operations_on_closed_ring_raise():
     desc = _unique_description("closed-ring")
     ring = Ring(description=desc, sections=[(0, 4, 16)])

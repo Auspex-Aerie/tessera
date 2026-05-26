@@ -168,6 +168,45 @@ impl Region {
             .open()
             .map_err(|e| TesseraRingError::Region(format!("attach: {e}")))?;
 
+        // Codex P1 fix on PR #2 / commit d467b14: before any raw copy
+        // out of the mapped bytes, verify the attached region is at
+        // least as large as our expected layout requires. Without this
+        // check, attaching to a stale / corrupt / wrong-producer SHM
+        // segment of the same name (e.g. a 128-byte truncated leftover)
+        // would let read_global_header copy 128 bytes from a region
+        // that doesn't have them — UB.
+        //
+        // Expected size is computed from the CALLER's section config
+        // (not the on-disk header, which we haven't safely read yet).
+        // If the on-disk region has a different config, the subsequent
+        // global-header + section-header validation will catch the
+        // semantic mismatch; this length check is purely about
+        // bounds-safety before the first unsafe copy.
+        let pairs: Vec<(u32, u32)> = sections
+            .iter()
+            .map(|s| (s.slot_count(), s.slot_size_bytes()))
+            .collect();
+        let expected_size = region_size_bytes(&pairs).ok_or_else(|| {
+            TesseraRingError::Config(format!(
+                "region size overflow across {} sections (caller's per-section \
+                slot_count * slot_size_bytes exceeds usize::MAX)",
+                sections.len()
+            ))
+        })?;
+        if shmem.len() < expected_size {
+            return Err(TesseraRingError::Region(format!(
+                "attached SHM region '{name}' is smaller than expected: caller's section \
+                config requires at least {expected_size} bytes (GlobalHeader {} + section \
+                table + per-section slot data for {} sections), but the mapped region is \
+                only {} bytes. Possible causes: stale SHM segment from a prior crashed \
+                peer, wrong namespace handle, or caller's section config doesn't match the \
+                creator's. Bailing out before any raw byte access (Codex P1 #2).",
+                GlobalHeader::SIZE,
+                sections.len(),
+                shmem.len()
+            )));
+        }
+
         let (section_id_to_ordinal, section_data_offsets) =
             build_section_lookup_tables(sections);
         let region = Region {
@@ -969,10 +1008,20 @@ mod tests {
 
     #[test]
     fn attach_rejects_section_geometry_mismatch() {
+        // After Codex P1 fix on PR #2 added a bounds check that fires
+        // BEFORE the semantic geometry check, this test now has to be
+        // careful: the attacher's expected region size must be ≤ the
+        // creator's actual region size so the bounds check passes and
+        // the semantic check is what fires. Use a creator with a LARGER
+        // geometry than the attacher claims, so:
+        //   - creator's actual region is large enough that
+        //     shmem.len() >= attacher's expected_size (bounds passes)
+        //   - but on-disk SectionHeader.slot_count != attacher's slot_count
+        //     (SectionConfigMismatch fires).
         let handle = unique_handle("section-geometry");
-        let creator_sections = vec![SectionConfig::new(0, 4, 1024)];
+        let creator_sections = vec![SectionConfig::new(0, 8, 1024)];
         let _creator = Region::create(&handle, &creator_sections, false).expect("create");
-        let attacher_sections = vec![SectionConfig::new(0, 8, 1024)];
+        let attacher_sections = vec![SectionConfig::new(0, 4, 1024)];
         let err = Region::attach(&handle, &attacher_sections).unwrap_err();
         match err {
             TesseraRingError::SectionConfigMismatch {
@@ -982,8 +1031,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(section_id, 0);
-                assert_eq!(expected_count, 8);
-                assert_eq!(found_count, 4);
+                assert_eq!(expected_count, 4);
+                assert_eq!(found_count, 8);
             }
             other => panic!("expected SectionConfigMismatch, got {other:?}"),
         }
@@ -1221,5 +1270,32 @@ mod tests {
         assert!(matches!(refused, Err(TesseraRingError::Region(_))));
         // With force_recreate it succeeds.
         let _second = Region::create(&handle, &sections, true).expect("force_recreate");
+    }
+
+    #[test]
+    fn attach_rejects_undersized_region() {
+        // Codex P1 fix on PR #2 / commit d467b14: attach must check
+        // shmem.len() against the caller's expected region size before
+        // any raw byte copy. Verify by creating a region with one
+        // section config (small expected size) and attaching with a
+        // section config requiring more bytes — the mapping is the
+        // SAME size, so the attached length is too small for the
+        // attacher's expectation, and attach must fail with a clear
+        // bounds error rather than reading past the end.
+        let handle = unique_handle("undersized");
+        let creator_sections = vec![SectionConfig::new(0, 1, 8)];
+        let _creator = Region::create(&handle, &creator_sections, false).expect("create");
+        // Attacher requires section config 100x larger.
+        let attacher_sections = vec![SectionConfig::new(0, 100, 1024)];
+        let err = Region::attach(&handle, &attacher_sections).unwrap_err();
+        match err {
+            TesseraRingError::Region(msg) => {
+                assert!(
+                    msg.contains("smaller than expected") || msg.contains("Bailing out"),
+                    "expected size-mismatch bounds error, got: {msg}"
+                );
+            }
+            other => panic!("expected Region bounds error, got {other:?}"),
+        }
     }
 }
