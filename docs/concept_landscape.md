@@ -6,7 +6,7 @@ scope, and what's a future candidate. It's a living map; treat it as
 authoritative for "what category does X belong to?" questions but not
 as a roadmap commitment.
 
-**Status**: working notes, untracked. Not part of the side-doc
+**Status**: tracked reference doc, but not part of the side-doc
 authority chain (`mp_tools_open_source_extraction_2026-05-23.md` is
 still the locked spec for decisions); this is the higher-altitude
 mental model that frames where each spec'd piece sits.
