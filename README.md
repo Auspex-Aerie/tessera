@@ -4,6 +4,15 @@
 > **Pool** (lease-backed shared-memory slots), **Ring** (lossy mmap-backed broadcast),
 > **Sink** (atomic-write worker pool over Pool).
 
+> **Status (pre-v0.1):** Tessera is being extracted from a set of
+> multi-process tools we've been running in production. The port is
+> nearly complete — Pool and Ring have landed, Sink (and a non-lossy
+> Channel primitive used by Sink) are the remaining pieces — and we'll
+> remove this banner once everything is wired up, integrated back into
+> our own environment, and validated end-to-end. Until then, expect
+> rapid iteration and occasional API churn on the still-in-flight
+> components.
+
 A *tessera* is the small tile that fills a slot in a mosaic. Each component
 in this library hands out tesserae — typed slot-tokens — backed by shared
 memory or memory-mapped regions. The result: producer and worker
