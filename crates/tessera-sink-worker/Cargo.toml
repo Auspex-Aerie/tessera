@@ -1,0 +1,20 @@
+[package]
+name = "tessera-sink-worker"
+description = "Worker executable spawned by tessera-sink (Tessera Sink)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "tessera-sink-worker"
+path = "src/main.rs"
+
+[dependencies]
+tessera-sink = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

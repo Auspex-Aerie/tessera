@@ -5,6 +5,7 @@ members = [
     "crates/tessera-ring",
     "crates/tessera-channel",
     "crates/tessera-sink",
+    "crates/tessera-sink-worker",
     "python/py-tessera-pool",
     "python/py-tessera-ring",
     "python/py-tessera-channel",
