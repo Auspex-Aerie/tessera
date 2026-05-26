@@ -275,28 +275,41 @@ def test_attacher_cannot_mutate():
 
 
 def test_context_manager_releases_on_exit():
-    """Pool's Drop fires when the Python object is garbage-collected,
-    which unlinks the SHM segment. After the first Pool is fully
-    reclaimed (force GC so timing is deterministic), a fresh Pool with
-    the same description can be created.
-
-    Note: as of the Codex P1 fix, `Pool::new` no longer blindly
-    unlinks an existing same-name segment — it refuses to clobber. So
-    this test depends on the first Pool's Drop actually firing
-    BEFORE the second `Pool(...)` call. We force the GC explicitly.
+    """`__exit__` deterministically closes the Pool (drops the RustPool,
+    unlinks the SHM region). After the `with` block exits, a fresh
+    Pool with the same description can be created without any GC dance.
     """
-    import gc
-
     desc = _unique_description("ctxmgr-recycle")
     with Pool(description=desc, slot_count=1, slot_size_bytes=64, ttl_seconds=10.0) as p1:
         lease = p1.acquire(timeout_seconds=1.0)
         p1.release(lease)
-    # Force the first Pool to be reclaimed — Drop unlinks the SHM segment.
-    del p1
-    gc.collect()
-    # Now a fresh Pool with the same description can claim the name.
+        assert p1.is_closed is False
+    # After __exit__: deterministic close, no gc.collect() needed.
+    assert p1.is_closed is True
+
     with Pool(description=desc, slot_count=1, slot_size_bytes=64, ttl_seconds=10.0) as p2:
         assert p2.is_owner is True
+
+
+def test_operations_on_closed_pool_raise():
+    """All Pool operations except `close()` and the `is_closed` getter
+    must raise `TesseraPoolError("Pool is closed")` after close.
+    `close()` itself must be idempotent."""
+    desc = _unique_description("closed-ops")
+    pool = Pool(description=desc, slot_count=1, slot_size_bytes=64, ttl_seconds=10.0)
+    pool.close()
+    assert pool.is_closed is True
+
+    with pytest.raises(TesseraPoolError, match="closed"):
+        pool.acquire(timeout_seconds=0.05)
+    with pytest.raises(TesseraPoolError, match="closed"):
+        pool.in_use_count()
+    with pytest.raises(TesseraPoolError, match="closed"):
+        pool.reclaim_stale()
+
+    # close() is idempotent.
+    pool.close()
+    pool.close()
 
 
 def test_concurrent_create_with_live_owner_refuses_to_clobber():

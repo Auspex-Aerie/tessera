@@ -197,12 +197,44 @@ struct PyPool {
     // underlying RustPool needs &mut for mutations. parking_lot::Mutex
     // is cheap and re-entrant-free (so we won't accidentally deadlock
     // ourselves).
-    inner: Mutex<RustPool>,
+    //
+    // Option<RustPool> so `close()` / `__exit__` can deterministically
+    // drop the inner Pool (which unlinks the SHM region in its Drop
+    // impl) without relying on Python's GC timing. After close, all
+    // operations return TesseraPoolError("Pool is closed").
+    inner: Mutex<Option<RustPool>>,
     // Cached so getters don't have to lock.
     is_owner: bool,
     slot_count: u32,
     slot_size_bytes: u32,
     ttl_micros: u64,
+}
+
+impl PyPool {
+    /// Locked-mutable access to the inner Pool, or `Pool is closed` if
+    /// the user has already exited the context manager.
+    fn with_inner_mut<R>(
+        &self,
+        op: impl FnOnce(&mut RustPool) -> Result<R, RustPoolError>,
+    ) -> PyResult<R> {
+        let mut guard = self.inner.lock();
+        let pool = guard
+            .as_mut()
+            .ok_or_else(|| TesseraPoolError::new_err("Pool is closed"))?;
+        op(pool).map_err(map_err)
+    }
+
+    /// Locked-immutable access (only `read_payload` uses this).
+    fn with_inner<R>(
+        &self,
+        op: impl FnOnce(&RustPool) -> Result<R, RustPoolError>,
+    ) -> PyResult<R> {
+        let guard = self.inner.lock();
+        let pool = guard
+            .as_ref()
+            .ok_or_else(|| TesseraPoolError::new_err("Pool is closed"))?;
+        op(pool).map_err(map_err)
+    }
 }
 
 #[pymethods]
@@ -245,7 +277,7 @@ impl PyPool {
             slot_count: pool.slot_count(),
             slot_size_bytes: pool.slot_size_bytes(),
             ttl_micros: pool.ttl_micros(),
-            inner: Mutex::new(pool),
+            inner: Mutex::new(Some(pool)),
         })
     }
 
@@ -274,8 +306,15 @@ impl PyPool {
     }
 
     /// Current count of leased slots. Useful for monitoring.
-    fn in_use_count(&self) -> u32 {
-        self.inner.lock().in_use_count()
+    fn in_use_count(&self) -> PyResult<u32> {
+        self.with_inner(|p| Ok(p.in_use_count()))
+    }
+
+    /// True if the Pool has been closed (either via `close()` or by
+    /// leaving its `with` block).
+    #[getter]
+    fn is_closed(&self) -> bool {
+        self.inner.lock().is_none()
     }
 
     /// Acquire one free slot (owner-only). Blocks up to
@@ -283,8 +322,8 @@ impl PyPool {
     #[pyo3(signature = (timeout_seconds=30.0))]
     fn acquire(&self, timeout_seconds: f64) -> PyResult<PyLease> {
         let timeout = Duration::from_secs_f64(timeout_seconds.max(0.0));
-        let lease = self.inner.lock().acquire(timeout).map_err(map_err)?;
-        Ok(PyLease { inner: lease })
+        self.with_inner_mut(|p| p.acquire(timeout))
+            .map(|inner| PyLease { inner })
     }
 
     /// Write a payload into the leased slot. One-shot per lease;
@@ -302,12 +341,8 @@ impl PyPool {
         // payload bytes Vec; needs care around the Send bound on the
         // captured mutex guard.
         let bytes = payload.as_bytes();
-        let descriptor = self
-            .inner
-            .lock()
-            .write(&lease.inner, bytes)
-            .map_err(map_err)?;
-        Ok(PyDescriptor { inner: descriptor })
+        self.with_inner_mut(|p| p.write(&lease.inner, bytes))
+            .map(|inner| PyDescriptor { inner })
     }
 
     /// Read the bytes referenced by a descriptor. Available to both
@@ -318,29 +353,38 @@ impl PyPool {
         py: Python<'py>,
         descriptor: &PyDescriptor,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self
-            .inner
-            .lock()
-            .read_payload(&descriptor.inner)
-            .map_err(map_err)?;
+        let bytes = self.with_inner(|p| p.read_payload(&descriptor.inner))?;
         Ok(PyBytes::new_bound(py, &bytes))
     }
 
     /// Release a leased slot (owner-only).
     fn release(&self, lease: &PyLease) -> PyResult<()> {
-        self.inner.lock().release(&lease.inner).map_err(map_err)
+        self.with_inner_mut(|p| p.release(&lease.inner))
     }
 
     /// Renew a lease's `acquired_at` (owner-only). Use during long
     /// owner-side operations to prevent reclaim_stale from reclaiming.
     fn renew(&self, lease: &PyLease) -> PyResult<()> {
-        self.inner.lock().renew(&lease.inner).map_err(map_err)
+        self.with_inner_mut(|p| p.renew(&lease.inner))
     }
 
     /// Reclaim slots whose lease has been outstanding longer than the
     /// configured TTL. Returns the count reclaimed. Owner-only.
     fn reclaim_stale(&self) -> PyResult<u32> {
-        self.inner.lock().reclaim_stale().map_err(map_err)
+        self.with_inner_mut(|p| p.reclaim_stale())
+    }
+
+    /// Drop the underlying Rust Pool, unlinking the SHM region (for
+    /// owner Pools) and detaching the mapping (for attachers).
+    ///
+    /// Idempotent: calling close() on an already-closed Pool is a no-op.
+    /// After close, all other operations raise TesseraPoolError("Pool
+    /// is closed").
+    fn close(&self) -> PyResult<()> {
+        // Taking the Option out of the Mutex drops the RustPool here;
+        // Shmem's Drop runs the underlying shm_unlink for owner mappings.
+        self.inner.lock().take();
+        Ok(())
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {
@@ -353,10 +397,10 @@ impl PyPool {
         _exc_value: PyObject,
         _traceback: PyObject,
     ) -> PyResult<()> {
-        // Resource cleanup happens via Drop on the underlying RustPool
-        // when the Python object is finalized. No-op here keeps the
-        // protocol satisfied.
-        Ok(())
+        // Honor context-manager semantics: deterministic cleanup at
+        // scope exit, NOT deferred to Python GC. Drops the RustPool
+        // which unlinks the SHM region.
+        self.close()
     }
 
     fn __repr__(&self) -> String {
