@@ -449,13 +449,37 @@ impl Region {
                 )
             })?;
             // SAFETY: cname is a valid NUL-terminated C string;
-            // shm_unlink is thread-safe POSIX. Return value is
-            // ignored because this is best-effort cleanup (ENOENT
-            // on a missing name is normal — though with the
-            // manually_unlinked short-circuit above we should never
-            // reach here twice for the same Region).
-            unsafe {
-                libc::shm_unlink(cname.as_ptr());
+            // shm_unlink is thread-safe POSIX.
+            //
+            // Codex iter-4 P1 on PR #4 (comment 3305006943): we now
+            // check the return value. If shm_unlink fails for a real
+            // reason (e.g. EACCES from a uid change mid-operation),
+            // we MUST NOT flip the state flags below — otherwise the
+            // caller has no way to retry, and Drop-time unlink is
+            // also suppressed, leaving the OS name live and breaking
+            // the cleanup/handoff guarantees this method advertises.
+            //
+            // ENOENT is treated as success: "name already gone" is
+            // the desired post-condition of unlink, regardless of
+            // who removed it.
+            let rc = unsafe { libc::shm_unlink(cname.as_ptr()) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ENOENT) {
+                    return Err(TesseraPoolError::Region(format!(
+                        "shm_unlink('{}') failed: {} (errno={:?}). Region state \
+                        flags NOT updated; caller may retry unlink(), or drop \
+                        the Region to let Shmem's drop-time unlink attempt \
+                        cleanup.",
+                        self.shm_name,
+                        err,
+                        err.raw_os_error(),
+                    )));
+                }
+                // ENOENT: name was already gone (some other peer
+                // removed it, or this is a retry after a transient
+                // failure). Falls through to the state-flip below as
+                // a successful unlink.
             }
         }
         // Codex P1 on PR #4 iter-1 (comment 3304769711): suppress
@@ -464,6 +488,10 @@ impl Region {
         // a fresh region with the same name, then A finally drops)
         // would have A's drop call shm_unlink AGAIN, racily removing
         // B's freshly created name.
+        //
+        // Codex iter-4 (comment 3305006943): only reached after
+        // shm_unlink succeeded (or returned ENOENT). On real
+        // failure we early-returned above without touching state.
         self.shmem.set_owner(false);
         // Block any future unlink() call from this Region (Codex
         // iter-3 fix). Subsequent calls hit the early-return above.
