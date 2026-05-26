@@ -51,6 +51,7 @@ pub mod config;
 pub mod error;
 pub mod messages;
 pub mod names;
+pub mod worker;
 
 // Re-export the underlying primitives so a consumer can pull the
 // descriptor / lease / role types from one import in v0.x.
@@ -59,3 +60,4 @@ pub use tessera_pool;
 
 pub use config::SinkConfig;
 pub use error::{Result, TesseraSinkError};
+pub use worker::{run_worker, WorkerParams};

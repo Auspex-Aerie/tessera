@@ -23,6 +23,7 @@ use crate::error::{Result, TesseraSinkError};
 const TAG_CHUNK_DESCRIPTOR: u8 = 1;
 const TAG_COMMIT: u8 = 2;
 const TAG_CANCEL: u8 = 3;
+const TAG_SHUTDOWN: u8 = 4;
 
 // Ack-plane tags (worker → owner).
 const TAG_CHUNK_ACK: u8 = 16;
@@ -65,6 +66,10 @@ pub enum ControlMessage {
         /// 128-bit job identifier.
         job_id: u128,
     },
+    /// Graceful stop: the worker should clean up any in-flight temp
+    /// files and exit its run loop. Sent by the owner on Sink shutdown
+    /// after all jobs have drained.
+    Shutdown,
 }
 
 /// Worker → owner ack-plane message.
@@ -141,6 +146,9 @@ impl ControlMessage {
                 w.put_u8(TAG_CANCEL);
                 w.put_u128(*job_id);
             }
+            ControlMessage::Shutdown => {
+                w.put_u8(TAG_SHUTDOWN);
+            }
         }
         w.into_inner()
     }
@@ -166,6 +174,7 @@ impl ControlMessage {
             TAG_CANCEL => ControlMessage::Cancel {
                 job_id: r.get_u128()?,
             },
+            TAG_SHUTDOWN => ControlMessage::Shutdown,
             other => {
                 return Err(TesseraSinkError::Protocol(format!(
                     "unknown control message tag {other}"
@@ -415,6 +424,12 @@ mod tests {
         let msg = ControlMessage::Cancel { job_id: u128::MAX };
         let bytes = msg.encode();
         assert_eq!(ControlMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn control_shutdown_round_trips() {
+        let msg = ControlMessage::Shutdown;
+        assert_eq!(ControlMessage::decode(&msg.encode()).unwrap(), msg);
     }
 
     #[test]
