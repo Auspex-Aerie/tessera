@@ -30,6 +30,7 @@ const TAG_CHUNK_ACK: u8 = 16;
 const TAG_CHUNK_FAILED: u8 = 17;
 const TAG_CANCEL_ACK: u8 = 18;
 const TAG_JOB_COMPLETE: u8 = 19;
+const TAG_WORKER_READY: u8 = 20;
 
 /// Owner → worker control-plane message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +76,16 @@ pub enum ControlMessage {
 /// Worker → owner ack-plane message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AckMessage {
+    /// Startup handshake: the worker has attached its Pool, **created**
+    /// its control region, and attached the ack plane. The owner waits
+    /// for this before attaching its control Sender, so it never binds
+    /// to a stale control region a crashed predecessor left behind
+    /// (the worker's `force_recreate` has already unlinked + recreated
+    /// it by the time this is sent).
+    WorkerReady {
+        /// Index of the worker that is ready.
+        worker_id: u32,
+    },
     /// A chunk was streamed to the temp file successfully; the owner
     /// may release the chunk's Pool lease.
     ChunkAck {
@@ -191,6 +202,10 @@ impl AckMessage {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         match self {
+            AckMessage::WorkerReady { worker_id } => {
+                w.put_u8(TAG_WORKER_READY);
+                w.put_u32(*worker_id);
+            }
             AckMessage::ChunkAck {
                 job_id,
                 chunk_index,
@@ -234,6 +249,9 @@ impl AckMessage {
         let mut r = Reader::new(bytes);
         let tag = r.get_u8()?;
         let msg = match tag {
+            TAG_WORKER_READY => AckMessage::WorkerReady {
+                worker_id: r.get_u32()?,
+            },
             TAG_CHUNK_ACK => AckMessage::ChunkAck {
                 job_id: r.get_u128()?,
                 chunk_index: r.get_u32()?,
@@ -473,6 +491,12 @@ mod tests {
     #[test]
     fn ack_cancel_ack_round_trips() {
         let msg = AckMessage::CancelAck { job_id: 123 };
+        assert_eq!(AckMessage::decode(&msg.encode()).unwrap(), msg);
+    }
+
+    #[test]
+    fn ack_worker_ready_round_trips() {
+        let msg = AckMessage::WorkerReady { worker_id: 5 };
         assert_eq!(AckMessage::decode(&msg.encode()).unwrap(), msg);
     }
 

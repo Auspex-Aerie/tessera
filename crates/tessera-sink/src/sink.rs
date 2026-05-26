@@ -35,6 +35,9 @@ const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Grace period for a worker to exit after `Shutdown` before we kill it.
 const WORKER_EXIT_GRACE: Duration = Duration::from_secs(2);
 
+/// How long `Sink::start` waits for all workers to signal readiness.
+const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Terminal-or-pending status of a submitted job.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum JobStatus {
@@ -103,45 +106,48 @@ impl Sink {
         let mut workers: Vec<Child> = Vec::with_capacity(config.worker_count as usize);
         let mut controls: Vec<Channel> = Vec::with_capacity(config.worker_count as usize);
 
-        // If any worker fails to spawn or attach, the children we've
-        // already launched must be killed: dropping `Child` does NOT
-        // terminate the process, so they'd otherwise become orphans
-        // holding SHM mappings and blocking a retry. Run the spawn loop
-        // in a closure so a single error path handles the cleanup.
-        let build = (|| -> Result<()> {
-            for worker_id in 0..config.worker_count {
-                let params = Self::worker_params(&base, &config, worker_id);
-                let mut child = spawn::build_worker_command(&bin, &params)
-                    .spawn()
-                    .map_err(|e| TesseraSinkError::WorkerSpawn {
+        // Startup is a three-step barrier. On any failure, kill every
+        // child spawned so far: dropping `Child` does NOT terminate the
+        // process, so survivors would become orphans holding SHM
+        // mappings and blocking a retry.
+        //
+        // 1. Spawn all workers. Each creates its own control region
+        //    (Receiver) and signals readiness on the ack plane.
+        for worker_id in 0..config.worker_count {
+            let params = Self::worker_params(&base, &config, worker_id);
+            match spawn::build_worker_command(&bin, &params).spawn() {
+                Ok(child) => workers.push(child),
+                Err(e) => {
+                    Self::kill_all(&mut workers);
+                    return Err(TesseraSinkError::WorkerSpawn {
                         worker_id,
                         message: e.to_string(),
-                    })?;
-                // Worker creates its control region as Receiver; we
-                // attach as Sender, retrying until it exists (or dies).
-                match Self::attach_control(&base, &config, worker_id, &mut child) {
-                    Ok(control) => {
-                        workers.push(child);
-                        controls.push(control);
-                    }
-                    Err(e) => {
-                        // This child isn't tracked yet — kill it here;
-                        // the outer cleanup handles the already-pushed ones.
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(e);
-                    }
+                    });
                 }
             }
-            Ok(())
-        })();
+        }
 
-        if let Err(e) = build {
-            for mut child in workers.drain(..) {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        // 2. Wait for every worker's WorkerReady. This is the barrier
+        //    that prevents binding to a stale control region: a worker
+        //    only signals after it has created (force_recreate-clobbered,
+        //    if needed) its control region, so by the time we attach in
+        //    step 3 the region name resolves to the fresh segment.
+        if let Err(e) = Self::await_all_ready(&ack, &mut workers, config.worker_count) {
+            Self::kill_all(&mut workers);
             return Err(e);
+        }
+
+        // 3. Attach a control Sender to each worker. The region is
+        //    guaranteed to exist now, so this succeeds promptly.
+        for worker_id in 0..config.worker_count {
+            let child = &mut workers[worker_id as usize];
+            match Self::attach_control(&base, &config, worker_id, child) {
+                Ok(control) => controls.push(control),
+                Err(e) => {
+                    Self::kill_all(&mut workers);
+                    return Err(e);
+                }
+            }
         }
 
         Ok(Self {
@@ -174,6 +180,60 @@ impl Sink {
         }
     }
 
+    /// Kill and reap every spawned child. Best-effort; used on a failed
+    /// start so no worker survives as an orphan holding SHM mappings.
+    fn kill_all(workers: &mut Vec<Child>) {
+        for mut child in workers.drain(..) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Drain the ack plane until every worker has sent `WorkerReady`.
+    /// Bounded by `WORKER_READY_TIMEOUT`; fails fast if a child exits
+    /// before signalling.
+    fn await_all_ready(ack: &Channel, workers: &mut [Child], worker_count: u32) -> Result<()> {
+        let deadline = Instant::now() + WORKER_READY_TIMEOUT;
+        let mut ready = vec![false; worker_count as usize];
+        let mut remaining = worker_count;
+        while remaining > 0 {
+            match ack.recv_timeout(Duration::from_millis(50)) {
+                Ok(bytes) => {
+                    if let AckMessage::WorkerReady { worker_id } = AckMessage::decode(&bytes)? {
+                        if let Some(slot) = ready.get_mut(worker_id as usize) {
+                            if !*slot {
+                                *slot = true;
+                                remaining -= 1;
+                            }
+                        }
+                    }
+                    // Only WorkerReady can arrive before startup completes.
+                }
+                Err(TesseraChannelError::Timeout { .. }) => {
+                    for (i, child) in workers.iter_mut().enumerate() {
+                        if let Ok(Some(status)) = child.try_wait() {
+                            return Err(TesseraSinkError::WorkerSpawn {
+                                worker_id: i as u32,
+                                message: format!("worker exited during startup: {status}"),
+                            });
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(TesseraSinkError::Timeout {
+                            timeout_micros: WORKER_READY_TIMEOUT.as_micros() as u64,
+                            context: format!(
+                                "waiting for worker readiness ({} of {worker_count} ready)",
+                                worker_count - remaining
+                            ),
+                        });
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
     fn attach_control(
         base: &str,
         config: &SinkConfig,
@@ -192,8 +252,10 @@ impl Sink {
             match Channel::open(cfg.clone()) {
                 Ok(c) => return Ok(c),
                 Err(_) => {
-                    // Worker may not have created the region yet. Fail
-                    // fast if it already exited; otherwise retry.
+                    // The worker signalled WorkerReady before we got here,
+                    // so its control region exists; this retry is just
+                    // belt-and-suspenders for a transient open failure.
+                    // Fail fast if the worker died in the meantime.
                     if let Ok(Some(status)) = child.try_wait() {
                         return Err(TesseraSinkError::WorkerSpawn {
                             worker_id,
@@ -379,6 +441,9 @@ impl Sink {
 
     fn handle_ack(&mut self, msg: AckMessage) {
         match msg {
+            // Consumed during the startup barrier; ignore if it somehow
+            // arrives later (e.g. a duplicate).
+            AckMessage::WorkerReady { .. } => {}
             AckMessage::ChunkAck {
                 job_id,
                 chunk_index,
