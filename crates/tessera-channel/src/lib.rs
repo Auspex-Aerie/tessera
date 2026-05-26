@@ -22,8 +22,11 @@
 
 pub mod error;
 pub mod header;
+pub mod namespace;
+pub mod region;
 
 pub use error::{ChannelRoleSnapshot, Result, TesseraChannelError};
+pub use namespace::NamespaceHandle;
 
 /// Role this Channel handle is opened with.
 ///
