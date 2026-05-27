@@ -575,6 +575,30 @@ mod tests {
     }
 
     #[test]
+    fn close_cancels_blocked_recv_promptly() {
+        // A receiver blocked in recv() on an empty queue must be woken
+        // with Closed when another handle marks the Channel closed —
+        // well under any timeout (recv() here is the un-timed variant
+        // that would otherwise block forever).
+        use std::thread;
+        use std::time::Instant;
+        let (receiver, _sender) = open_receiver_and_sender("close-cancel-recv", 16, 64);
+        let r = receiver.clone(); // shares the closed flag via Arc
+        let waiter = thread::spawn(move || {
+            let start = Instant::now();
+            let res = r.recv();
+            (res, start.elapsed())
+        });
+
+        thread::sleep(Duration::from_millis(50)); // let it block in recv
+        receiver.mark_closed();
+
+        let (res, elapsed) = waiter.join().expect("waiter panicked");
+        assert!(matches!(res, Err(TesseraChannelError::Closed)), "expected Closed, got {res:?}");
+        assert!(elapsed < Duration::from_secs(5), "close should cancel promptly; took {elapsed:?}");
+    }
+
+    #[test]
     fn try_recv_returns_promptly_when_head_slot_claimed_but_not_ready() {
         // Codex PR #8 P1 fix (channel.rs:342) regression: simulate a
         // sender that claimed the head slot (incremented tail) but

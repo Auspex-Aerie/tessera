@@ -897,4 +897,48 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         reader.join().expect("reader panicked");
     }
+
+    // --- close / cancel + cross-thread progress (Constraint 2) -----
+
+    #[test]
+    fn close_cancels_blocked_acquire_promptly() {
+        use std::sync::Arc;
+        // Single slot, leased → the next acquire blocks. mark_closed()
+        // from another thread must wake it with Closed, well under the
+        // 30s timeout it asked for.
+        let pool = Arc::new(Pool::new(owner_config("close-cancel", 1, 64)).expect("new"));
+        let _held = pool.acquire(Duration::from_secs(1)).expect("hold only slot");
+
+        let p = Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || {
+            let start = Instant::now();
+            let res = p.acquire(Duration::from_secs(30));
+            (res, start.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(50)); // let it enter the wait
+        pool.mark_closed();
+
+        let (res, elapsed) = waiter.join().expect("waiter panicked");
+        assert!(matches!(res, Err(TesseraPoolError::Closed)), "expected Closed, got {res:?}");
+        assert!(elapsed < Duration::from_secs(5), "close should cancel promptly; took {elapsed:?}");
+    }
+
+    #[test]
+    fn acquire_unblocks_on_cross_thread_release() {
+        use std::sync::Arc;
+        // The deadlock guard: a blocked acquire (single slot leased) must
+        // be freed by a release running on a DIFFERENT thread.
+        let pool = Arc::new(Pool::new(owner_config("xthread-release", 1, 64)).expect("new"));
+        let held = pool.acquire(Duration::from_secs(1)).expect("hold");
+
+        let p = Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || p.acquire(Duration::from_secs(30)));
+
+        std::thread::sleep(Duration::from_millis(50));
+        pool.release(&held).expect("cross-thread release frees the slot");
+
+        let lease = waiter.join().expect("waiter panicked").expect("acquire after release");
+        pool.release(&lease).expect("release");
+    }
 }
