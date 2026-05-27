@@ -346,12 +346,23 @@ impl Pool {
                 self.region.slot_count()
             )));
         }
-        // Hold the per-slot lock across validate-then-copy so a
-        // concurrent in-process write / release / reclaim of this slot
-        // can't tear the read. (Cross-process tearing is prevented by
-        // the generation check in validate_descriptor + the owner
-        // protocol of holding the lease until the reader acks.)
-        let _guard = self.slot_locks[slot_index as usize].lock();
+        // Hold this Pool's per-slot lock across validate-then-copy so a
+        // concurrent write / release / reclaim *on the same Pool
+        // instance* can't tear the read.
+        //
+        // But that lock does NOT serialize against a *different* Pool
+        // instance for the same region — e.g. a same-process attacher vs
+        // the owner (separate `slot_locks` arrays), or a cross-process
+        // worker (no shared mutex possible at all). For those, we use a
+        // seqlock-style generation re-check: read the slot meta, copy the
+        // payload, then re-read the meta. Any reuse path bumps the
+        // generation (reclaim_stale ++ and acquire ++ on the slot), so a
+        // generation/lease change across the copy means the bytes may be
+        // torn → fail StaleHandle instead of returning wrong data
+        // (Codex PR #13 round 3). `release` keeps the generation, but it
+        // also doesn't repopulate the payload, and any subsequent
+        // acquire of the slot bumps the generation before a new write.
+        let _guard = self.slot_lock(slot_index)?.lock();
         let meta = self.region.read_slot_meta(slot_index)?;
         validate_descriptor(descriptor, &meta)?;
         // Descriptor size must match what was actually written. A
@@ -376,7 +387,24 @@ impl Pool {
                 self.region.slot_size_bytes()
             )));
         }
-        self.region.read_slot_payload(slot_index, descriptor.size_bytes())
+        let payload = self
+            .region
+            .read_slot_payload(slot_index, descriptor.size_bytes())?;
+        // Seqlock re-check: if the slot's generation / lease changed
+        // while we were copying (a concurrent reclaim+reacquire on
+        // another instance / process), the copied bytes are untrustworthy.
+        let meta_after = self.region.read_slot_meta(slot_index)?;
+        if meta_after.generation != meta.generation
+            || meta_after.lease_id_high != meta.lease_id_high
+            || meta_after.lease_id_low != meta.lease_id_low
+        {
+            return Err(TesseraPoolError::StaleHandle {
+                slot_index,
+                descriptor_generation: meta.generation,
+                current_generation: meta_after.generation,
+            });
+        }
+        Ok(payload)
     }
 
     /// Release a leased slot (owner-only). The slot's metadata is
@@ -972,5 +1000,34 @@ mod tests {
         assert!(matches!(pool.write(&bogus, b"x"), Err(TesseraPoolError::Region(_))));
         assert!(matches!(pool.release(&bogus), Err(TesseraPoolError::Region(_))));
         assert!(matches!(pool.renew(&bogus), Err(TesseraPoolError::Region(_))));
+    }
+
+    #[test]
+    fn cross_instance_attacher_read_and_stale_detection() {
+        // Codex PR #13 round 3: an owner Pool and a SEPARATE attacher
+        // Pool for the same region (same process → DISTINCT slot_locks)
+        // must still read correctly and detect a reclaim through the
+        // shared SHM generation, not return stale bytes.
+        let mut config = owner_config("xinstance", 1, 64);
+        config.ttl_micros = 1; // so reclaim_stale fires after a brief sleep
+        let owner = Pool::new(config.clone()).expect("owner");
+        let attacher = Pool::new(PoolConfig {
+            is_owner: false,
+            ..config.clone()
+        })
+        .expect("attacher");
+
+        let lease = owner.acquire(Duration::from_secs(1)).expect("acquire");
+        let desc = owner.write(&lease, b"original").expect("write");
+        // Separate-instance attacher reads the payload correctly.
+        assert_eq!(attacher.read_payload(&desc).expect("read"), b"original");
+
+        // Owner reclaims (generation bumps in shared SHM). The attacher's
+        // descriptor is now stale even though its private slot_locks never
+        // observed the owner's mutation.
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(owner.reclaim_stale().expect("reclaim"), 1);
+        let err = attacher.read_payload(&desc).unwrap_err();
+        assert!(matches!(err, TesseraPoolError::StaleHandle { .. }), "got {err:?}");
     }
 }
