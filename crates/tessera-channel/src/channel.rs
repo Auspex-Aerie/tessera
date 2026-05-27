@@ -10,9 +10,11 @@
 //! `sequence` cross-check; no seqlock retry is needed on the read side
 //! because only one Receiver consumes.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use parking_lot::Mutex;
 
 use crate::error::{Result, TesseraChannelError};
 use crate::namespace::NamespaceHandle;
@@ -48,7 +50,35 @@ enum RecvOutcome {
 pub struct Channel {
     region: Arc<Region>,
     role: ChannelRole,
+    /// Serializes the single-consumer dequeue. The MPSC send path is
+    /// concurrency-safe by design (CAS on `tail`), but `recv`'s
+    /// load-head → copy-slot → clear-ready → advance-head sequence is
+    /// **not** safe under two concurrent receivers (one could free a
+    /// slot the other is still copying). This lock makes concurrent
+    /// `recv`/`try_recv`/`recv_timeout` on the same region serialize
+    /// rather than race. `Arc` so it is shared across `Channel` clones
+    /// of the same receiver. Senders never take it, so a `recv` blocked
+    /// holding it never impedes a sender's progress (Constraint 2).
+    recv_lock: Arc<Mutex<()>>,
+    /// Set by `mark_closed()` when the owning facade closes/drops.
+    /// Blocking `send`/`recv` wait loops check it each iteration and
+    /// return `Closed` promptly. `Arc` so it is shared across `Channel`
+    /// clones of the same region (closing one handle cancels a blocking
+    /// op on another clone).
+    closed: Arc<AtomicBool>,
 }
+
+// SAFETY: `Channel` is `!Send + !Sync` by default because `Arc<Region>`
+// wraps a `Shmem` raw pointer. The pointer addresses a process-global
+// mmap valid from any thread. The send path is multi-producer-safe by
+// the CAS-on-`tail` + per-slot `sequence`/`ready` protocol (designed for
+// concurrent senders across threads and processes). The single-consumer
+// dequeue is serialized in-process by `recv_lock`; cross-process there is
+// only ever one receiver (the region creator). Drop is a thread-agnostic
+// `munmap`/`shm_unlink`. Hence moving a `Channel` between threads and
+// sharing `&Channel` across threads are sound.
+unsafe impl Send for Channel {}
+unsafe impl Sync for Channel {}
 
 impl Channel {
     /// Open a Channel per the config: BLAKE3-derive the namespace
@@ -72,12 +102,27 @@ impl Channel {
         Ok(Self {
             region: Arc::new(region),
             role: config.role,
+            recv_lock: Arc::new(Mutex::new(())),
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// Role this Channel handle was opened with.
     pub fn role(&self) -> ChannelRole {
         self.role
+    }
+
+    /// Mark the Channel closed. A thread blocked in `send`/`recv`
+    /// observes this on its next loop iteration and returns `Closed`.
+    /// Idempotent. Called by the facade on `close()` / drop before it
+    /// releases its handle; cross-clone via the shared `Arc`.
+    pub fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Whether `mark_closed` has been called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     /// True iff this handle was opened as the region creator (Receiver).
@@ -115,6 +160,9 @@ impl Channel {
         self.require_role(ChannelRole::Sender)?;
         self.validate_payload_len(bytes.len())?;
         loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TesseraChannelError::Closed);
+            }
             if self.try_send_inner(bytes)? {
                 return Ok(());
             }
@@ -159,6 +207,9 @@ impl Channel {
         self.validate_payload_len(bytes.len())?;
         let deadline = Instant::now() + timeout;
         loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TesseraChannelError::Closed);
+            }
             if self.try_send_inner(bytes)? {
                 return Ok(());
             }
@@ -285,7 +336,13 @@ impl Channel {
     /// Role: must be opened as `Receiver`.
     pub fn recv(&self) -> Result<Vec<u8>> {
         self.require_role(ChannelRole::Receiver)?;
+        // Serialize concurrent receivers (held across the wait; only
+        // other receivers contend — senders never take this lock).
+        let _recv_guard = self.recv_lock.lock();
         loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TesseraChannelError::Closed);
+            }
             match self.try_recv_inner()? {
                 RecvOutcome::Got(msg) => return Ok(msg),
                 // Empty (head == tail) OR NotReady (head < tail but
@@ -320,6 +377,17 @@ impl Channel {
     /// Role: must be opened as `Receiver`.
     pub fn try_recv(&self) -> Result<Vec<u8>> {
         self.require_role(ChannelRole::Receiver)?;
+        // Non-blocking: if another receiver currently holds the dequeue
+        // lock, there's nothing this caller can take right now — report
+        // empty instead of blocking, preserving the non-blocking
+        // contract under shared/cloned receivers (Codex PR #13 P1).
+        let _recv_guard = match self.recv_lock.try_lock() {
+            Some(g) => g,
+            None => {
+                let head = self.region.head_atomic().load(Ordering::Acquire);
+                return Err(TesseraChannelError::ChannelEmpty { head });
+            }
+        };
         match self.try_recv_inner()? {
             RecvOutcome::Got(msg) => Ok(msg),
             RecvOutcome::Empty | RecvOutcome::NotReady => {
@@ -334,8 +402,25 @@ impl Channel {
     /// Role: must be opened as `Receiver`.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Vec<u8>> {
         self.require_role(ChannelRole::Receiver)?;
+        // Bound the TOTAL wait — including time spent waiting for another
+        // receiver to release the dequeue lock — by the caller's timeout
+        // (Codex PR #13 P1). The deadline is set BEFORE acquiring the
+        // lock, and the lock acquisition itself respects it.
         let deadline = Instant::now() + timeout;
+        let _recv_guard = match self.recv_lock.try_lock_until(deadline) {
+            Some(g) => g,
+            None => {
+                return Err(TesseraChannelError::Timeout {
+                    timeout_micros: timeout.as_micros() as u64,
+                    head: self.region.head_atomic().load(Ordering::Acquire),
+                    tail: self.region.tail_atomic().load(Ordering::Acquire),
+                });
+            }
+        };
         loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TesseraChannelError::Closed);
+            }
             match self.try_recv_inner()? {
                 RecvOutcome::Got(msg) => return Ok(msg),
                 RecvOutcome::Empty | RecvOutcome::NotReady => {
@@ -475,6 +560,111 @@ mod tests {
         })
         .expect("sender open");
         (receiver, sender)
+    }
+
+    #[test]
+    fn shared_sender_handle_across_threads() {
+        // Shares ONE sender Channel (via clone) across threads — only
+        // compiles if `Channel: Send + Sync`, and proves the in-process
+        // multi-producer path works through a single shared handle (not
+        // just one-handle-per-thread like the other concurrency tests).
+        use std::thread;
+        let (receiver, sender) = open_receiver_and_sender("shared-sender", 1024, 64);
+        let n_threads = 4u32;
+        let per = 100u32;
+        let total = (n_threads * per) as usize; // 400 < slot_count, fits without draining
+
+        let mut handles = Vec::new();
+        for t in 0..n_threads {
+            let s = sender.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..per {
+                    s.send(format!("t{t}-{i}").as_bytes()).expect("send");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("sender thread panicked");
+        }
+
+        let mut got = 0usize;
+        while got < total {
+            receiver.recv().expect("recv");
+            got += 1;
+        }
+        assert_eq!(got, total);
+        let (head, tail) = receiver.positions();
+        assert_eq!(head, tail, "queue should be fully drained");
+    }
+
+    #[test]
+    fn close_cancels_blocked_recv_promptly() {
+        // A receiver blocked in recv() on an empty queue must be woken
+        // with Closed when another handle marks the Channel closed —
+        // well under any timeout (recv() here is the un-timed variant
+        // that would otherwise block forever).
+        use std::thread;
+        use std::time::Instant;
+        let (receiver, _sender) = open_receiver_and_sender("close-cancel-recv", 16, 64);
+        let r = receiver.clone(); // shares the closed flag via Arc
+        let waiter = thread::spawn(move || {
+            let start = Instant::now();
+            let res = r.recv();
+            (res, start.elapsed())
+        });
+
+        thread::sleep(Duration::from_millis(50)); // let it block in recv
+        receiver.mark_closed();
+
+        let (res, elapsed) = waiter.join().expect("waiter panicked");
+        assert!(matches!(res, Err(TesseraChannelError::Closed)), "expected Closed, got {res:?}");
+        assert!(elapsed < Duration::from_secs(5), "close should cancel promptly; took {elapsed:?}");
+    }
+
+    #[test]
+    fn try_recv_stays_nonblocking_behind_active_recv() {
+        // Codex PR #13 P1: while one thread is parked in recv() (holding
+        // the dequeue lock), try_recv() on a shared/cloned receiver must
+        // return ChannelEmpty promptly, not block behind the lock.
+        use std::thread;
+        use std::time::Instant;
+        let (receiver, _sender) = open_receiver_and_sender("tryrecv-nonblock", 16, 64);
+        let r = receiver.clone();
+        let waiter = thread::spawn(move || r.recv()); // blocks; holds recv_lock
+        thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        let res = receiver.try_recv();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(res, Err(TesseraChannelError::ChannelEmpty { .. })),
+            "expected ChannelEmpty, got {res:?}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "try_recv blocked behind recv: {elapsed:?}");
+
+        receiver.mark_closed(); // cancel the parked recv
+        let _ = waiter.join().expect("waiter panicked");
+    }
+
+    #[test]
+    fn recv_timeout_stays_bounded_behind_active_recv() {
+        // Codex PR #13 P1: recv_timeout's deadline must cover the time
+        // spent waiting for another receiver's lock, not start after it.
+        use std::thread;
+        use std::time::Instant;
+        let (receiver, _sender) = open_receiver_and_sender("recvto-bounded", 16, 64);
+        let r = receiver.clone();
+        let waiter = thread::spawn(move || r.recv()); // blocks; holds recv_lock
+        thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        let res = receiver.recv_timeout(Duration::from_millis(100));
+        let elapsed = start.elapsed();
+        assert!(matches!(res, Err(TesseraChannelError::Timeout { .. })), "expected Timeout, got {res:?}");
+        assert!(elapsed < Duration::from_secs(2), "recv_timeout exceeded its bound: {elapsed:?}");
+
+        receiver.mark_closed();
+        let _ = waiter.join().expect("waiter panicked");
     }
 
     #[test]
