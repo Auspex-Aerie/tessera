@@ -214,6 +214,20 @@ impl Pool {
         self.region.slot_size_bytes()
     }
 
+    /// Bounds-checked access to a slot's lock. A `Lease`/`Descriptor`
+    /// can carry an out-of-range `slot_index` (reconstructed from
+    /// pickle, or built via the public `Lease::new`), so indexing
+    /// `slot_locks` directly would panic. Returning a `Region` error
+    /// keeps a malformed/stale handle from crashing the caller.
+    fn slot_lock(&self, slot_index: u32) -> Result<&Mutex<()>> {
+        self.slot_locks.get(slot_index as usize).ok_or_else(|| {
+            TesseraPoolError::Region(format!(
+                "slot_index {slot_index} out of range (slot_count={})",
+                self.slot_locks.len()
+            ))
+        })
+    }
+
     /// Acquire a free slot (owner-only). Blocks up to `timeout` for
     /// availability; polls the lock-free queue every 5 ms.
     ///
@@ -281,7 +295,7 @@ impl Pool {
             });
         }
 
-        let _guard = self.slot_locks[lease.slot_index() as usize].lock();
+        let _guard = self.slot_lock(lease.slot_index())?.lock();
         let mut meta = self.region.read_slot_meta(lease.slot_index())?;
         validate_lease(lease, &meta)?;
         if meta.payload_finalized() {
@@ -367,7 +381,7 @@ impl Pool {
             .owner_state
             .as_ref()
             .ok_or(TesseraPoolError::OwnerOnly)?;
-        let _guard = self.slot_locks[lease.slot_index() as usize].lock();
+        let _guard = self.slot_lock(lease.slot_index())?.lock();
         let meta = self.region.read_slot_meta(lease.slot_index())?;
         validate_lease(lease, &meta)?;
         // Clear meta — but DO NOT bump generation on a normal release.
@@ -392,7 +406,7 @@ impl Pool {
         if self.owner_state.is_none() {
             return Err(TesseraPoolError::OwnerOnly);
         }
-        let _guard = self.slot_locks[lease.slot_index() as usize].lock();
+        let _guard = self.slot_lock(lease.slot_index())?.lock();
         let mut meta = self.region.read_slot_meta(lease.slot_index())?;
         validate_lease(lease, &meta)?;
         meta.acquired_at_micros = monotonic_micros();
@@ -940,5 +954,18 @@ mod tests {
 
         let lease = waiter.join().expect("waiter panicked").expect("acquire after release");
         pool.release(&lease).expect("release");
+    }
+
+    #[test]
+    fn out_of_range_lease_errors_not_panics() {
+        // Codex PR #13 P2: a Lease with slot_index >= slot_count (built
+        // via the public Lease::new, or reconstructed from a stale /
+        // malformed pickled handle) must produce a Region error, not
+        // panic on the per-slot lock lookup.
+        let pool = Pool::new(owner_config("oob-lease", 2, 64)).expect("new");
+        let bogus = Lease::new(99, LeaseId::from_bytes([0u8; 16]), 0);
+        assert!(matches!(pool.write(&bogus, b"x"), Err(TesseraPoolError::Region(_))));
+        assert!(matches!(pool.release(&bogus), Err(TesseraPoolError::Region(_))));
+        assert!(matches!(pool.renew(&bogus), Err(TesseraPoolError::Region(_))));
     }
 }
