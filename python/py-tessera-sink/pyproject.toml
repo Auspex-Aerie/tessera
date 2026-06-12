@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/Indubitable-Industries/tessera"
+Repository = "https://github.com/auspexlabs/tessera"
 
 [tool.maturin]
 module-name = "tessera_sink._native"

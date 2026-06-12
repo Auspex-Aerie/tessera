@@ -21,7 +21,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/Indubitable-Industries/tessera"
+Repository = "https://github.com/auspexlabs/tessera"
 
 [project.optional-dependencies]
 test = ["pytest>=7", "syrupy>=4"]
