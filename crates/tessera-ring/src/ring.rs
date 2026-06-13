@@ -145,14 +145,40 @@ impl Ring {
     }
 
     /// Issue a new `Reader` handle for a specific section, starting
-    /// at the current writer position. Historical replay from buffered
-    /// slots is deferred.
+    /// at the current writer position ([`ReaderStart::Current`]). Use
+    /// [`Ring::reader_with`] to replay the retained backlog instead.
     pub fn reader(&self, section_id: u32) -> Result<Reader> {
+        self.reader_with(section_id, ReaderStart::Current)
+    }
+
+    /// Issue a new `Reader` handle for a specific section with an
+    /// explicit start position.
+    ///
+    /// [`ReaderStart::Current`] matches [`Ring::reader`]: the cursor
+    /// begins at the section's current writer position and only events
+    /// published afterwards are observed. [`ReaderStart::Oldest`]
+    /// begins at the oldest entry still retained in the section's ring
+    /// (`max(0, writer_position - slot_count)`), so a consumer that
+    /// attaches mid-run — a monitoring TUI, for example — replays the
+    /// available backlog before going live.
+    ///
+    /// Replay can race writers at the tail: entries overwritten while
+    /// being drained are skipped and accounted in `dropped`, exactly
+    /// like any other lap. Entries older than the retained window are
+    /// gone regardless — the Ring is lossy by design.
+    pub fn reader_with(&self, section_id: u32, start: ReaderStart) -> Result<Reader> {
         let ordinal = self.region.section_ordinal(section_id)?;
-        let cursor = self
+        let latest = self
             .region
             .writer_position_atomic(ordinal)?
             .load(Ordering::Acquire);
+        let cursor = match start {
+            ReaderStart::Current => latest,
+            ReaderStart::Oldest => {
+                let slot_count = self.region.slot_count(ordinal)?;
+                latest.saturating_sub(slot_count as u64)
+            }
+        };
         Ok(Reader {
             region: Arc::clone(&self.region),
             section_id,
@@ -338,6 +364,22 @@ pub struct Event {
     pub payload: Vec<u8>,
 }
 
+/// Where a new [`Reader`]'s cursor starts (see [`Ring::reader_with`]).
+///
+/// Reader cursors are process-local — this choice affects only the new
+/// handle and nothing in shared memory.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ReaderStart {
+    /// Start at the section's current writer position: observe only
+    /// events published after the reader is created. The default, and
+    /// the behavior of [`Ring::reader`].
+    #[default]
+    Current,
+    /// Start at the oldest entry still retained in the section's ring:
+    /// replay the available backlog before going live.
+    Oldest,
+}
+
 /// Per-section reader handle. Maintains a process-local cursor and a
 /// drop counter; multiple Readers on the same section are independent.
 #[derive(Clone)]
@@ -521,6 +563,97 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("tessera-ring-state-test/{tag}/{pid}/{nanos}")
+    }
+
+    #[test]
+    fn reader_with_oldest_replays_retained_backlog() {
+        let cfg = RingConfig {
+            description: unique_description("oldest-backlog"),
+            sections: vec![SectionConfig::new(0, 8, 256)],
+            is_owner: true,
+            force_recreate: false,
+        };
+        let ring = Ring::open(cfg).expect("open");
+        let writer = ring.writer();
+        for i in 0..5u32 {
+            writer
+                .publish(0, format!("e{i}").as_bytes())
+                .expect("publish");
+        }
+
+        // Mid-run attach: Oldest replays everything still retained...
+        let mut oldest = ring
+            .reader_with(0, ReaderStart::Oldest)
+            .expect("oldest reader");
+        let events = oldest.poll().expect("poll");
+        assert_eq!(events.len(), 5);
+        for (i, e) in events.iter().enumerate() {
+            assert_eq!(e.position, i as u64);
+            assert_eq!(e.payload, format!("e{i}").as_bytes());
+        }
+        assert_eq!(oldest.dropped(), 0);
+
+        // ...while Current created at the same moment sees nothing old.
+        let mut current = ring
+            .reader_with(0, ReaderStart::Current)
+            .expect("current reader");
+        assert!(current.poll().expect("poll").is_empty());
+
+        // Both go live identically for new events.
+        writer.publish(0, b"live").expect("publish");
+        assert_eq!(oldest.poll().expect("poll").len(), 1);
+        assert_eq!(current.poll().expect("poll").len(), 1);
+    }
+
+    #[test]
+    fn reader_with_oldest_after_wrap_starts_at_oldest_retained() {
+        let cfg = RingConfig {
+            description: unique_description("oldest-wrap"),
+            sections: vec![SectionConfig::new(0, 4, 64)],
+            is_owner: true,
+            force_recreate: false,
+        };
+        let ring = Ring::open(cfg).expect("open");
+        let writer = ring.writer();
+        for i in 0..10u32 {
+            writer
+                .publish(0, format!("e{i}").as_bytes())
+                .expect("publish");
+        }
+
+        // 10 published into 4 slots: only positions 6..=9 are retained.
+        let mut reader = ring
+            .reader_with(0, ReaderStart::Oldest)
+            .expect("oldest reader");
+        assert_eq!(reader.cursor(), 6);
+        let events = reader.poll().expect("poll");
+        assert_eq!(events.len(), 4);
+        assert_eq!(
+            events.iter().map(|e| e.position).collect::<Vec<_>>(),
+            vec![6, 7, 8, 9]
+        );
+        // Starting at oldest_available is not a lap: nothing dropped.
+        assert_eq!(reader.dropped(), 0);
+    }
+
+    #[test]
+    fn reader_default_matches_reader_with_current() {
+        let cfg = RingConfig {
+            description: unique_description("current-parity"),
+            sections: vec![SectionConfig::new(0, 8, 64)],
+            is_owner: true,
+            force_recreate: false,
+        };
+        let ring = Ring::open(cfg).expect("open");
+        let writer = ring.writer();
+        writer.publish(0, b"before").expect("publish");
+
+        let via_default = ring.reader(0).expect("reader");
+        let via_with = ring
+            .reader_with(0, ReaderStart::Current)
+            .expect("reader_with");
+        assert_eq!(via_default.cursor(), via_with.cursor());
+        assert_eq!(ReaderStart::default(), ReaderStart::Current);
     }
 
     #[test]

@@ -20,7 +20,7 @@ pub mod ring;
 
 pub use error::{Result, TesseraRingError};
 pub use namespace::NamespaceHandle;
-pub use ring::{Event, Reader, ReaderStats, Ring, RingConfig, Writer};
+pub use ring::{Event, Reader, ReaderStart, ReaderStats, Ring, RingConfig, Writer};
 
 /// Per-section configuration supplied by the caller at `Ring::open`.
 ///

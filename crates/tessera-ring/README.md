@@ -24,9 +24,12 @@ is still pre-v0.1 and not yet published.
 - **Per-slot seqlock** — writers stamp odd-then-even around the payload
   copy; readers check the sequence and slot position before accepting a
   payload.
-- **Fresh-reader semantics** — `Ring::reader(section_id)` starts at the
-  current writer position. New readers see future events, not historical
-  ring contents.
+- **Caller-chosen reader start** — `Ring::reader(section_id)` starts at
+  the current writer position (future events only). For mid-run attach,
+  `Ring::reader_with(section_id, ReaderStart::Oldest)` starts at the
+  oldest retained entry and replays the available backlog before going
+  live. Cursors are process-local, so the choice affects nothing in
+  shared memory.
 - **Lossy by design** — if writers lap a reader, the oldest unread entry
   is overwritten and the reader's `stats().dropped` increases.
 
