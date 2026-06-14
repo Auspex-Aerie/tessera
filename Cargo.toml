@@ -6,6 +6,7 @@ members = [
     "crates/tessera-channel",
     "crates/tessera-sink",
     "crates/tessera-sink-worker",
+    "crates/tessera-slate",
     "python/py-tessera-pool",
     "python/py-tessera-ring",
     "python/py-tessera-channel",
@@ -26,6 +27,7 @@ tessera-pool = { path = "crates/tessera-pool", version = "0.0.1" }
 tessera-ring = { path = "crates/tessera-ring", version = "0.0.1" }
 tessera-channel = { path = "crates/tessera-channel", version = "0.0.1" }
 tessera-sink = { path = "crates/tessera-sink", version = "0.0.1" }
+tessera-slate = { path = "crates/tessera-slate", version = "0.0.1" }
 
 # Shared third-party
 blake3 = "1.5"

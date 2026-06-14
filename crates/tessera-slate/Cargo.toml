@@ -1,0 +1,20 @@
+[package]
+name = "tessera-slate"
+description = "Seqlock-protected latest-value snapshot slot table (Tessera Slate)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[lib]
+name = "tessera_slate"
+
+[dependencies]
+blake3 = { workspace = true }
+bytemuck = { version = "1.16", features = ["derive", "min_const_generics"] }
+libc = "0.2"
+shared_memory = "0.12"
+thiserror = "1"
