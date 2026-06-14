@@ -6,6 +6,7 @@ Tessera is a Rust workspace with thin Python facades for shared-memory IPC:
 - **Ring**: lossy mmap-backed broadcast for telemetry-shaped streams.
 - **Channel**: non-lossy MPSC shared-memory queue for control and ack planes.
 - **Sink**: atomic disk-write worker pool composed from Pool and Channel.
+- **Slate**: seqlock latest-value snapshot slot table for current-state planes.
 
 > **Status: pre-v0.1.** The Rust cores, PyO3 facades, examples, and Sink worker
 > binary are implemented, but Tessera is not published yet. The v0.1.0 release
@@ -39,9 +40,19 @@ byte-level primitives:
 | [`tessera-ring`](crates/tessera-ring/) | `tessera_ring` | Yes | Multi-writer, multi-reader broadcast. Per-section writer positions, per-reader local cursors, gap accounting. |
 | [`tessera-channel`](crates/tessera-channel/) | `tessera_channel` | No | Multi-producer, single-consumer FIFO queue with blocking, try, and timeout send/recv modes. |
 | [`tessera-sink`](crates/tessera-sink/) | `tessera_sink` | No | Worker-subprocess disk writer with chunking, BLAKE3 integrity, and atomic temp-file rename. |
+| [`tessera-slate`](crates/tessera-slate/) | `tessera_slate` *(planned)* | n/a | Single-writer-per-slot, multi-reader snapshot table: overwrite-in-place latest value, per-slot seqlock + bounded-retry readers, bytes-only. |
 
 Each Rust crate is usable directly from Rust. Each Python package in
-[`python/`](python/) exposes the same core capability through PyO3.
+[`python/`](python/) exposes the same core capability through PyO3. (The
+`tessera-slate` Python facade is planned; its Rust core is implemented.)
+
+> **Slate sizing — known limitation (planned for v0.2).** Slate currently
+> uses a single uniform `slot_size_bytes` for every slot. Heterogeneous /
+> per-group slot sizes are something callers may well want, and will come
+> later as a non-breaking format addition. For now sizes are homogeneous:
+> the intended use case (snapshot boards of similarly-sized records) makes
+> the uniform-padding overhead negligible against total system RAM, so it
+> is deferred — an acknowledged deficiency, not an oversight.
 
 ## Concurrency Contract
 
@@ -148,7 +159,8 @@ For complete runnable demos, see [`examples/`](examples/).
 - **Bytes-only boundary.** v0.1 surfaces accept and return bytes. Callers choose
   Arrow, pickle, bincode, JSON, or any other serialization above Tessera.
 - **Explicit topology.** Pool is large-payload handoff, Ring is lossy broadcast,
-  Channel is reliable single-consumer queue, and Sink is a composite service.
+  Channel is reliable single-consumer queue, Slate is latest-value snapshots,
+  and Sink is a composite service.
 
 ## Release Readiness
 
@@ -159,6 +171,8 @@ For complete runnable demos, see [`examples/`](examples/).
 | Ring surface consumed by Auspice (cross-language Python↔Rust integration) | validated |
 | Channel Rust core + PyO3 facade | implemented |
 | Sink Rust core + PyO3 facade + `tessera-sink-worker` | implemented |
+| Slate Rust core (`tessera-slate`) | implemented |
+| Slate PyO3 facade | planned |
 | Certus re-import and production validation | next gate |
 | crates.io / PyPI release | deferred until the Certus gate passes |
 
@@ -178,7 +192,8 @@ tessera/
 │   ├── tessera-ring/
 │   ├── tessera-channel/
 │   ├── tessera-sink/
-│   └── tessera-sink-worker/
+│   ├── tessera-sink-worker/
+│   └── tessera-slate/
 ├── python/
 │   ├── py-tessera-pool/
 │   ├── py-tessera-ring/
