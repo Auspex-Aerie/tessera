@@ -172,14 +172,16 @@ For complete runnable demos, see [`examples/`](examples/).
 | Channel Rust core + PyO3 facade | implemented |
 | Sink Rust core + PyO3 facade + `tessera-sink-worker` | implemented |
 | Slate Rust core (`tessera-slate`) | implemented |
+| Slate surface consumed by Auspice (typed board layer; cross-language Python↔Rust integration) | validated |
 | Slate PyO3 facade | planned |
 | Certus re-import and production validation | next gate |
 | crates.io / PyPI release | deferred until the Certus gate passes |
 
-The `tessera-ring` surface that Auspice consumes (Python writer → Rust reader,
-the log/telemetry plane) has been exercised end-to-end by a cross-language
-integration and is considered stable; the remaining v0.1 gate above concerns
-the broader Certus re-import, not that consumed path.
+Both Tessera surfaces Auspice consumes — `tessera-ring` (the log/telemetry
+stream) and `tessera-slate` (the metrics snapshot, via Auspice's typed board
+layer) — have been exercised end-to-end by a cross-language Python↔Rust
+integration and are stable for that consumed path; the remaining v0.1 gate
+above concerns the broader Certus re-import.
 
 ## Workspace Layout
 
