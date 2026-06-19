@@ -2,7 +2,7 @@
 
 Append-only ledger for decisions, deferrals, hypotheses, discoveries, incidents,
 outages, and human corrections. Maintained per
-[ADR-Light](https://github.com/auspexlabs/ADRLight): one grep-able file, causal
+[ADR-Light](https://github.com/Auspex-Aerie/ADRLight): one grep-able file, causal
 edges (`triggered_by`, `supersedes`, `resolves`), status-line-only edits to past
 entries.
 

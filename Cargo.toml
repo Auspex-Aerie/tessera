@@ -17,7 +17,7 @@ members = [
 edition = "2021"
 version = "0.0.1"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/auspexlabs/tessera"
+repository = "https://github.com/Auspex-Aerie/tessera"
 authors = ["Indubitable Industries"]
 rust-version = "1.74"
 

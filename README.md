@@ -236,7 +236,7 @@ cargo build -p tessera-sink-worker
 - [`docs/concept_landscape.md`](docs/concept_landscape.md): primitive/service
   taxonomy and non-goals.
 - [`docs/decision_log.md`](docs/decision_log.md): the project decision ledger
-  ([ADR-Light](https://github.com/auspexlabs/ADRLight)) — why Tessera is shaped
+  ([ADR-Light](https://github.com/Auspex-Aerie/ADRLight)) — why Tessera is shaped
   the way it is.
 - [`docs/issue_facade_thread_safety.md`](docs/issue_facade_thread_safety.md):
   active thread-safety design issue before v0.1.

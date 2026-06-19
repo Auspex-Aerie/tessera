@@ -21,7 +21,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/auspexlabs/tessera"
+Repository = "https://github.com/Auspex-Aerie/tessera"
 
 [tool.maturin]
 module-name = "tessera_ring._native"

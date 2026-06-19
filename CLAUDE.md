@@ -5,7 +5,7 @@
 Record every architectural or policy decision — and deferrals, hypotheses,
 discoveries, incidents, outages, and human corrections — in
 [`docs/decision_log.md`](docs/decision_log.md), the append-only
-[ADR-Light](https://github.com/auspexlabs/ADRLight) ledger.
+[ADR-Light](https://github.com/Auspex-Aerie/ADRLight) ledger.
 
 - Append typed entries: `DEC` / `DEF` / `HYP` / `DIS` / `INC` / `OUT` / `BOT`.
 - The ledger allocates all IDs (one number space per type).
