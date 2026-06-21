@@ -168,20 +168,25 @@ For complete runnable demos, see [`examples/`](examples/).
 |---|---|
 | Pool Rust core + PyO3 facade | implemented |
 | Ring Rust core + PyO3 facade | implemented |
-| Ring surface consumed by Auspice (cross-language Python↔Rust integration) | validated |
+| Ring as Auspice's log plane (`tessera-ring`) | validated — cross-language Python↔Rust, multi-section (main + workers), oldest-replay backlog |
 | Channel Rust core + PyO3 facade | implemented |
 | Sink Rust core + PyO3 facade + `tessera-sink-worker` | implemented |
 | Slate Rust core (`tessera-slate`) | implemented |
-| Slate surface consumed by Auspice (typed board layer; cross-language Python↔Rust integration) | validated |
+| Slate as Auspice's metrics board (typed layer over `tessera-slate`) | validated — cross-language Python↔Rust, exact record/replay round-trip, headless read |
 | Slate PyO3 facade | planned |
 | Certus re-import and production validation | next gate |
 | crates.io / PyPI release | deferred until the Certus gate passes |
 
 Both Tessera surfaces Auspice consumes — `tessera-ring` (the log/telemetry
 stream) and `tessera-slate` (the metrics snapshot, via Auspice's typed board
-layer) — have been exercised end-to-end by a cross-language Python↔Rust
-integration and are stable for that consumed path; the remaining v0.1 gate
-above concerns the broader Certus re-import.
+layer) — are now the live backing for the Auspice TUI, not just a sample
+integration. They have been exercised end-to-end three ways: a cross-language
+Python↔Rust harness (Python writer → Slate board + Ring logs → Rust reader); an
+**exact record/replay round-trip** of the Slate board (a recorded board
+timeline replays into a fresh Slate region with every slot value reproduced);
+and **headless rendering** that reads the board with no terminal attached. They
+are stable for that consumed path; the remaining v0.1 gate above concerns the
+broader Certus re-import.
 
 ## Workspace Layout
 
