@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        package: [py-tessera-pool, py-tessera-ring, py-tessera-sink]
+        package: [py-tessera-pool, py-tessera-ring, py-tessera-sink, py-tessera-slate]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
