@@ -47,8 +47,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: install maturin + pytest
-        run: pip install maturin pytest
+      - name: install maturin + test deps
+        # syrupy backs py-tessera-pool's parity snapshot suite (declared in
+        # its [test] extra); harmless to install for the other facades.
+        run: pip install maturin pytest syrupy
       - name: build wheel
         run: maturin build --release --out dist --manifest-path python/${{ matrix.package }}/Cargo.toml
       # Sink's tests spawn the real tessera-sink-worker subprocess; build it
